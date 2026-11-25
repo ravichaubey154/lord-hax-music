@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import random
 import re
 import shutil
 import tempfile
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +26,13 @@ from config import BASE_DIR, BotConfig
 logger = logging.getLogger("music_bot")
 
 URL_REGEX = re.compile(r"^https?://", re.IGNORECASE)
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
 
 FFMPEG_BEFORE_OPTIONS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
@@ -49,7 +59,7 @@ def _resolve_cookiefile() -> Optional[str]:
 
 YTDL_BASE_OPTIONS: dict = {
     "format": "bestaudio/best",
-    "noplaylist": False,
+    "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
@@ -58,7 +68,15 @@ YTDL_BASE_OPTIONS: dict = {
     "ignoreerrors": False,
     "logtostderr": False,
     "geo_bypass": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android_vr", "default"],
+        }
+    },
 }
+
+if shutil.which("node"):
+    YTDL_BASE_OPTIONS["js_runtimes"] = {"node": {}}
 
 _COOKIE_FILE = _resolve_cookiefile()
 if _COOKIE_FILE:
@@ -67,6 +85,7 @@ if _COOKIE_FILE:
 
 YTDL_PLAYLIST_OPTIONS: dict = {
     **YTDL_BASE_OPTIONS,
+    "noplaylist": False,
     "extract_flat": "in_playlist",
     "ignoreerrors": True,
 }
@@ -124,6 +143,122 @@ class YTDLPExtractor:
     def _is_url(query: str) -> bool:
         return bool(URL_REGEX.match(query.strip()))
 
+    @staticmethod
+    def _normalize_url(url: str) -> tuple[str, bool]:
+        """Return (normalized_url, is_explicit_playlist).
+
+        Strips YouTube auto-mix/radio parameters (`list=RD...`, `start_radio=1`) from watch
+        URLs so single songs play cleanly instead of triggering huge radio playlist scrapes.
+        """
+        parsed = urllib.parse.urlparse(url.strip())
+        host = parsed.netloc.lower()
+        if host not in YOUTUBE_HOSTS:
+            return url.strip(), False
+
+        qs = urllib.parse.parse_qs(parsed.query)
+        video_id: Optional[str] = None
+        if host == "youtu.be":
+            seg = parsed.path.strip("/").split("/")[0]
+            if seg:
+                video_id = seg
+        elif parsed.path.startswith("/shorts/"):
+            seg = parsed.path.split("/shorts/", 1)[1].split("/")[0]
+            if seg:
+                video_id = seg
+        elif "v" in qs and qs["v"]:
+            video_id = qs["v"][0]
+
+        list_id = qs.get("list", [""])[0]
+        is_radio_or_mix = (
+            list_id.startswith(("RD", "LM", "WL", "LL"))
+            or "start_radio" in qs
+        )
+
+        # Explicit /playlist?list=PL... link (not an auto-mix)
+        if parsed.path.rstrip("/") == "/playlist" and list_id and not is_radio_or_mix:
+            return f"https://www.youtube.com/playlist?list={list_id}", True
+
+        # Watch/short/youtu.be link with a video ID -> play that exact track cleanly
+        if video_id:
+            if list_id and not is_radio_or_mix and parsed.path.rstrip("/") != "/watch":
+                return url.strip(), True
+            return f"https://www.youtube.com/watch?v={video_id}", False
+
+        return url.strip(), bool(list_id and not is_radio_or_mix)
+
+    @staticmethod
+    def _clean_search_title(title: str) -> str:
+        """Simplify a YouTube title for SoundCloud fallback search."""
+        cleaned = title.split("|")[0]
+        cleaned = re.sub(r"[\(\[\{][^)\]\}]*[\)\]\}]", " ", cleaned)
+        cleaned = re.sub(
+            r"\b(official|music|video|audio|lyric|lyrics|4k|hd|full\s*song|ft\.?|feat\.?)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—:")
+        return cleaned or title.strip()
+
+    @staticmethod
+    def _fetch_youtube_oembed_title(video_url: str) -> Optional[str]:
+        """Fetch a YouTube video's title via public oEmbed (works even on cloud datacenter IPs)."""
+        try:
+            oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode(
+                {"url": video_url, "format": "json"}
+            )
+            req = urllib.request.Request(
+                oembed_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                return data.get("title")
+        except Exception as exc:
+            logger.debug("oEmbed lookup failed for %s: %s", video_url, exc)
+            return None
+
+    @staticmethod
+    def _extract_with_fallbacks(
+        target: str,
+        *,
+        is_playlist: bool,
+        max_playlist_items: int,
+    ) -> Optional[dict]:
+        """Extract info using primary client, then alternative clients if cloud IP is blocked."""
+        if is_playlist:
+            opts = {
+                **YTDL_PLAYLIST_OPTIONS,
+                "playlistend": max_playlist_items,
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(target, download=False)
+
+        client_attempts = [
+            ["android_vr", "default"],
+            ["ios", "mweb", "web"],
+            ["default"],
+        ]
+        last_error: Optional[Exception] = None
+        for clients in client_attempts:
+            opts = {
+                **YTDL_BASE_OPTIONS,
+                "noplaylist": True,
+                "extractor_args": {"youtube": {"player_client": clients}},
+            }
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(target, download=False)
+                if info:
+                    return info
+            except Exception as exc:
+                last_error = exc
+                logger.warning("yt-dlp attempt (%s) failed for '%s': %s", clients, target, exc)
+
+        if last_error:
+            raise last_error
+        return None
+
     @classmethod
     async def search_tracks(
         cls,
@@ -136,25 +271,16 @@ class YTDLPExtractor:
         )
 
     @classmethod
-    def _search_tracks_sync(
+    def _info_to_tracks(
         cls,
-        query: str,
+        info: Optional[dict],
+        *,
+        is_url: bool,
         requester_id: int,
         requester_name: str,
         max_playlist_items: int,
+        override_title: Optional[str] = None,
     ) -> list[Track]:
-        cleaned = query.strip()
-        is_url = cls._is_url(cleaned)
-        search_target = cleaned if is_url else f"ytsearch1:{cleaned}"
-
-        # Use flat extraction for playlist URLs so large playlists queue quickly
-        opts = dict(YTDL_PLAYLIST_OPTIONS if is_url else YTDL_BASE_OPTIONS)
-        if not is_url:
-            opts["noplaylist"] = True
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(search_target, download=False)
-
         if not info:
             return []
 
@@ -174,10 +300,8 @@ class YTDLPExtractor:
             if not webpage_url:
                 continue
             if not URL_REGEX.match(webpage_url):
-                # Flat playlist entries often store the 11-char video ID in `url`
                 webpage_url = f"https://www.youtube.com/watch?v={webpage_url}"
 
-            # Only store direct stream_url if this was a full extraction (not flat playlist)
             stream_url = item.get("url") if item.get("acodec") or item.get("vcodec") else None
             if stream_url and stream_url == webpage_url:
                 stream_url = None
@@ -188,7 +312,7 @@ class YTDLPExtractor:
 
             tracks.append(
                 Track(
-                    title=item.get("title") or "Unknown Title",
+                    title=override_title or item.get("title") or "Unknown Title",
                     webpage_url=webpage_url,
                     requester_id=requester_id,
                     requester_name=requester_name,
@@ -199,8 +323,89 @@ class YTDLPExtractor:
                     http_headers=dict(item.get("http_headers") or {}),
                 )
             )
-
         return tracks
+
+    @classmethod
+    def _soundcloud_fallback(
+        cls,
+        search_query: str,
+        requester_id: int,
+        requester_name: str,
+    ) -> list[Track]:
+        """Fallback to SoundCloud search if YouTube blocks a cloud datacenter IP."""
+        cleaned = cls._clean_search_title(search_query)
+        logger.info("Falling back to SoundCloud search for: '%s'", cleaned)
+        opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"scsearch1:{cleaned}", download=False)
+        return cls._info_to_tracks(
+            info,
+            is_url=False,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            max_playlist_items=1,
+        )
+
+    @classmethod
+    def _search_tracks_sync(
+        cls,
+        query: str,
+        requester_id: int,
+        requester_name: str,
+        max_playlist_items: int,
+    ) -> list[Track]:
+        cleaned = query.strip()
+        is_url = cls._is_url(cleaned)
+        is_playlist = False
+
+        if is_url:
+            search_target, is_playlist = cls._normalize_url(cleaned)
+        else:
+            search_target = f"ytsearch1:{cleaned}"
+
+        try:
+            info = cls._extract_with_fallbacks(
+                search_target,
+                is_playlist=is_playlist,
+                max_playlist_items=max_playlist_items,
+            )
+            tracks = cls._info_to_tracks(
+                info,
+                is_url=is_url,
+                requester_id=requester_id,
+                requester_name=requester_name,
+                max_playlist_items=max_playlist_items,
+            )
+            if tracks:
+                return tracks
+        except Exception as primary_exc:
+            logger.warning("Primary extraction failed for '%s': %s", search_target, primary_exc)
+            # Fallback to SoundCloud when YouTube blocks cloud IPs
+            fallback_query: Optional[str] = None
+            if not is_url:
+                fallback_query = cleaned
+            elif any(h in search_target.lower() for h in ("youtube.com", "youtu.be")):
+                fallback_query = cls._fetch_youtube_oembed_title(search_target)
+
+            if fallback_query:
+                try:
+                    sc_tracks = cls._soundcloud_fallback(
+                        fallback_query, requester_id, requester_name
+                    )
+                    if sc_tracks:
+                        return sc_tracks
+                except Exception as sc_exc:
+                    logger.warning("SoundCloud fallback also failed: %s", sc_exc)
+            raise primary_exc
+
+        return []
 
     @classmethod
     async def resolve_stream(cls, track: Track) -> Track:
@@ -209,13 +414,11 @@ class YTDLPExtractor:
 
     @classmethod
     def _resolve_stream_sync(cls, track: Track) -> Track:
-        opts = {
-            **YTDL_BASE_OPTIONS,
-            "noplaylist": True,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(track.webpage_url, download=False)
-
+        info = cls._extract_with_fallbacks(
+            track.webpage_url,
+            is_playlist=False,
+            max_playlist_items=1,
+        )
         if not info:
             raise RuntimeError(f"Could not extract stream for: {track.title}")
 
