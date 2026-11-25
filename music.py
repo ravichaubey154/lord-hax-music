@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import random
 import re
 import shutil
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -16,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Literal, Optional
 
+from Crypto.Cipher import DES
 import discord
 import yt_dlp
 from discord import app_commands
@@ -68,6 +71,8 @@ YTDL_BASE_OPTIONS: dict = {
     "ignoreerrors": False,
     "logtostderr": False,
     "geo_bypass": True,
+    "socket_timeout": 10,
+    "retries": 1,
     "extractor_args": {
         "youtube": {
             "player_client": ["android_vr", "default"],
@@ -137,11 +142,22 @@ class Track:
 
 
 class YTDLPExtractor:
-    """Async wrapper around yt-dlp for searching and resolving YouTube audio streams."""
+    """Fast multi-source audio resolver (JioSaavn 320kbps + YouTube + SoundCloud non-preview)."""
+
+    _yt_blocked_until: float = 0.0
 
     @staticmethod
     def _is_url(query: str) -> bool:
         return bool(URL_REGEX.match(query.strip()))
+
+    @classmethod
+    def _prefer_cloud_fast_path(cls) -> bool:
+        """On Render without YouTube cookies (or after a recent YT IP block), use fast JioSaavn first."""
+        if _COOKIE_FILE:
+            return False
+        if os.getenv("RENDER", "").strip().lower() == "true":
+            return True
+        return time.monotonic() < cls._yt_blocked_until
 
     @staticmethod
     def _normalize_url(url: str) -> tuple[str, bool]:
@@ -174,11 +190,9 @@ class YTDLPExtractor:
             or "start_radio" in qs
         )
 
-        # Explicit /playlist?list=PL... link (not an auto-mix)
         if parsed.path.rstrip("/") == "/playlist" and list_id and not is_radio_or_mix:
             return f"https://www.youtube.com/playlist?list={list_id}", True
 
-        # Watch/short/youtu.be link with a video ID -> play that exact track cleanly
         if video_id:
             if list_id and not is_radio_or_mix and parsed.path.rstrip("/") != "/watch":
                 return url.strip(), True
@@ -188,21 +202,30 @@ class YTDLPExtractor:
 
     @staticmethod
     def _clean_search_title(title: str) -> str:
-        """Simplify a YouTube title for SoundCloud fallback search."""
-        cleaned = title.split("|")[0]
-        cleaned = re.sub(r"[\(\[\{][^)\]\}]*[\)\]\}]", " ", cleaned)
-        cleaned = re.sub(
-            r"\b(official|music|video|audio|lyric|lyrics|4k|hd|full\s*song|ft\.?|feat\.?)\b",
+        """Clean a YouTube video title while preserving artist names for exact matching."""
+        s = html.unescape(title)
+        s = re.sub(r"[\(\[\{][^)\]\}]*[\)\]\}]", " ", s)
+        s = re.sub(r"[|•·/\\]+", " ", s)
+        s = re.sub(
+            r"\b(official|music|video|audio|lyric|lyrics|lyrical|4k|hd|uhd|full\s*song|full\s*video|new\s*song|latest\s*song|song|ft\.?|feat\.?|prod\.?|records?|record|music\s*label|t-series|zeemusic|sony\s*music|kripa)\b",
             " ",
-            cleaned,
+            s,
             flags=re.IGNORECASE,
         )
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—:")
-        return cleaned or title.strip()
+        s = re.sub(r"\s+", " ", s).strip(" -–—:")
+        words = s.split()
+        return " ".join(words[:8]) if words else title.strip()
 
     @staticmethod
-    def _fetch_youtube_oembed_title(video_url: str) -> Optional[str]:
-        """Fetch a YouTube video's title via public oEmbed (works even on cloud datacenter IPs)."""
+    def _tokenize(text: str) -> set[str]:
+        return {
+            w for w in re.findall(r"[a-z0-9]+", html.unescape(text).lower())
+            if len(w) >= 2
+        }
+
+    @staticmethod
+    def _fetch_youtube_oembed(video_url: str) -> Optional[dict]:
+        """Fetch YouTube video title/thumbnail/author via public oEmbed (works on cloud IPs)."""
         try:
             oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode(
                 {"url": video_url, "format": "json"}
@@ -211,53 +234,134 @@ class YTDLPExtractor:
                 oembed_url,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                return data.get("title")
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="ignore"))
         except Exception as exc:
             logger.debug("oEmbed lookup failed for %s: %s", video_url, exc)
             return None
 
     @staticmethod
-    def _extract_with_fallbacks(
+    def _decrypt_saavn_url(enc_url: str, has_320: bool) -> str:
+        cipher = DES.new(b"38346591", DES.MODE_ECB)
+        raw = cipher.decrypt(base64.b64decode(enc_url.strip()))
+        pad = raw[-1]
+        url = raw[:-pad].decode("utf-8").replace("http://", "https://")
+        target = "_320.mp4" if has_320 else "_160.mp4"
+        return url.replace("_96.mp4", target)
+
+    @classmethod
+    def _saavn_search(
+        cls,
+        query: str,
+        requester_id: int,
+        requester_name: str,
+        *,
+        strict_match: bool = False,
+        override_webpage_url: Optional[str] = None,
+    ) -> list[Track]:
+        """Search JioSaavn for full-length studio audio (320kbps/160kbps, ~0.2s)."""
+        cleaned = cls._clean_search_title(query)
+        q_tokens = cls._tokenize(cleaned)
+        api_url = "https://www.jiosaavn.com/api.php?" + urllib.parse.urlencode(
+            {
+                "__call": "search.getResults",
+                "_format": "json",
+                "_marker": "0",
+                "api_version": "4",
+                "ctx": "web6dot0",
+                "n": "5",
+                "p": "1",
+                "q": cleaned,
+            }
+        )
+        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+        results = data.get("results") or []
+        best_track: Optional[Track] = None
+        best_score = -1.0
+
+        for idx, song in enumerate(results):
+            mi = song.get("more_info") or {}
+            enc = mi.get("encrypted_media_url")
+            if not enc:
+                continue
+
+            title = html.unescape(song.get("title") or "").strip()
+            artists = ", ".join(
+                html.unescape(a.get("name", ""))
+                for a in (mi.get("artistMap") or {}).get("primary_artists", [])
+                if a.get("name")
+            )
+            cand_tokens = cls._tokenize(f"{title} {artists}")
+            overlap = len(q_tokens & cand_tokens) / max(len(q_tokens), 1)
+            # Slight preference for earlier JioSaavn relevance rank
+            score = overlap - (idx * 0.03)
+
+            if score > best_score:
+                has_320 = str(mi.get("320kbps", "")).lower() == "true"
+                stream_url = cls._decrypt_saavn_url(enc, has_320)
+                duration_raw = mi.get("duration")
+                duration = int(duration_raw) if str(duration_raw or "").isdigit() else None
+                thumb = (song.get("image") or "").replace("150x150", "500x500") or None
+                display_title = f"{title} — {artists}" if artists else (title or cleaned)
+
+                best_score = score
+                best_track = Track(
+                    title=display_title,
+                    webpage_url=override_webpage_url or song.get("perma_url") or stream_url,
+                    requester_id=requester_id,
+                    requester_name=requester_name,
+                    duration=duration,
+                    thumbnail=thumb,
+                    uploader=artists or mi.get("label") or "JioSaavn",
+                    stream_url=stream_url,
+                )
+
+        if best_track is None:
+            return []
+        if strict_match and best_score < 0.35:
+            logger.info("JioSaavn best score %.2f too low for '%s'; skipping.", best_score, cleaned)
+            return []
+        logger.info("Resolved via JioSaavn (score=%.2f): %s (%ss)", best_score, best_track.title, best_track.duration)
+        return [best_track]
+
+    @classmethod
+    def _extract_youtube_once(
+        cls,
         target: str,
         *,
         is_playlist: bool,
         max_playlist_items: int,
     ) -> Optional[dict]:
-        """Extract info using primary client, then alternative clients if cloud IP is blocked."""
+        """Single fast yt-dlp attempt (avoids 70s retry loops when cloud IP is blocked)."""
         if is_playlist:
             opts = {
                 **YTDL_PLAYLIST_OPTIONS,
                 "playlistend": max_playlist_items,
             }
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(target, download=False)
-
-        client_attempts = [
-            ["android_vr", "default"],
-            ["ios", "mweb", "web"],
-            ["default"],
-        ]
-        last_error: Optional[Exception] = None
-        for clients in client_attempts:
+        else:
             opts = {
                 **YTDL_BASE_OPTIONS,
                 "noplaylist": True,
-                "extractor_args": {"youtube": {"player_client": clients}},
             }
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(target, download=False)
-                if info:
-                    return info
-            except Exception as exc:
-                last_error = exc
-                logger.warning("yt-dlp attempt (%s) failed for '%s': %s", clients, target, exc)
-
-        if last_error:
-            raise last_error
-        return None
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(target, download=False)
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            if any(
+                marker in err_lower
+                for marker in (
+                    "failed to extract any player response",
+                    "sign in to confirm",
+                    "http error 403",
+                )
+            ):
+                cls._yt_blocked_until = time.monotonic() + 1800
+                logger.warning("YouTube appears IP-blocked on this host; caching fast path for 30m.")
+            raise
 
     @classmethod
     async def search_tracks(
@@ -332,7 +436,7 @@ class YTDLPExtractor:
         requester_id: int,
         requester_name: str,
     ) -> list[Track]:
-        """Fallback to SoundCloud search if YouTube blocks a cloud datacenter IP."""
+        """Fallback to SoundCloud, preferring full-length non-preview tracks (>45s)."""
         cleaned = cls._clean_search_title(search_query)
         logger.info("Falling back to SoundCloud search for: '%s'", cleaned)
         opts = {
@@ -342,16 +446,86 @@ class YTDLPExtractor:
             "no_warnings": True,
             "nocheckcertificate": True,
             "geo_bypass": True,
+            "socket_timeout": 10,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"scsearch1:{cleaned}", download=False)
+            info = ydl.extract_info(f"scsearch5:{cleaned}", download=False)
+
+        entries = [e for e in (info.get("entries") or []) if e] if info else []
+        if not entries:
+            return []
+
+        # Filter out 30-second SoundCloud Go+ previews first
+        full_entries = [
+            e
+            for e in entries
+            if (e.get("duration") or 0) > 45 and "preview" not in (e.get("url") or "").lower()
+        ]
+        chosen = full_entries[0] if full_entries else entries[0]
         return cls._info_to_tracks(
-            info,
+            chosen,
             is_url=False,
             requester_id=requester_id,
             requester_name=requester_name,
             max_playlist_items=1,
         )
+
+    @classmethod
+    def _fast_cloud_resolve(
+        cls,
+        query: str,
+        is_url: bool,
+        search_target: str,
+        requester_id: int,
+        requester_name: str,
+    ) -> list[Track]:
+        """Fast <1s resolution via JioSaavn (320kbps full tracks) with SoundCloud non-preview fallback."""
+        lookup_query = query
+        override_url: Optional[str] = None
+        is_yt_url = is_url and any(h in search_target.lower() for h in ("youtube.com", "youtu.be"))
+
+        if is_yt_url:
+            oembed = cls._fetch_youtube_oembed(search_target)
+            if not oembed or not oembed.get("title"):
+                return []
+            lookup_query = oembed["title"]
+            override_url = search_target
+
+        # 1. Try JioSaavn first (~0.2s, full 320kbps studio audio)
+        try:
+            tracks = cls._saavn_search(
+                lookup_query,
+                requester_id,
+                requester_name,
+                strict_match=is_yt_url,
+                override_webpage_url=override_url,
+            )
+            if tracks:
+                return tracks
+            # Retry with just the first segment before `|` if full title had extra tags
+            if "|" in lookup_query:
+                short_q = lookup_query.split("|")[0].strip()
+                tracks = cls._saavn_search(
+                    short_q,
+                    requester_id,
+                    requester_name,
+                    strict_match=is_yt_url,
+                    override_webpage_url=override_url,
+                )
+                if tracks:
+                    return tracks
+        except Exception as saavn_exc:
+            logger.warning("JioSaavn lookup failed for '%s': %s", lookup_query, saavn_exc)
+
+        # 2. Fallback to SoundCloud full-length non-preview track
+        try:
+            sc_tracks = cls._soundcloud_fallback(lookup_query, requester_id, requester_name)
+            if sc_tracks:
+                return sc_tracks
+        except Exception as sc_exc:
+            logger.warning("SoundCloud fallback failed for '%s': %s", lookup_query, sc_exc)
+
+        return []
 
     @classmethod
     def _search_tracks_sync(
@@ -370,8 +544,21 @@ class YTDLPExtractor:
         else:
             search_target = f"ytsearch1:{cleaned}"
 
+        is_yt_or_search = (not is_url) or any(
+            h in search_target.lower() for h in ("youtube.com", "youtu.be")
+        )
+
+        # On Render cloud without YT cookies (or when YT IP is blocked), resolve instantly via JioSaavn first!
+        if is_yt_or_search and not is_playlist and cls._prefer_cloud_fast_path():
+            fast_tracks = cls._fast_cloud_resolve(
+                cleaned, is_url, search_target, requester_id, requester_name
+            )
+            if fast_tracks:
+                return fast_tracks
+
+        # Direct yt-dlp extraction (local PC, non-YouTube URLs, explicit playlists, or fallback)
         try:
-            info = cls._extract_with_fallbacks(
+            info = cls._extract_youtube_once(
                 search_target,
                 is_playlist=is_playlist,
                 max_playlist_items=max_playlist_items,
@@ -386,23 +573,13 @@ class YTDLPExtractor:
             if tracks:
                 return tracks
         except Exception as primary_exc:
-            logger.warning("Primary extraction failed for '%s': %s", search_target, primary_exc)
-            # Fallback to SoundCloud when YouTube blocks cloud IPs
-            fallback_query: Optional[str] = None
-            if not is_url:
-                fallback_query = cleaned
-            elif any(h in search_target.lower() for h in ("youtube.com", "youtu.be")):
-                fallback_query = cls._fetch_youtube_oembed_title(search_target)
-
-            if fallback_query:
-                try:
-                    sc_tracks = cls._soundcloud_fallback(
-                        fallback_query, requester_id, requester_name
-                    )
-                    if sc_tracks:
-                        return sc_tracks
-                except Exception as sc_exc:
-                    logger.warning("SoundCloud fallback also failed: %s", sc_exc)
+            logger.warning("Primary yt-dlp extraction failed for '%s': %s", search_target, primary_exc)
+            if is_yt_or_search:
+                fallback_tracks = cls._fast_cloud_resolve(
+                    cleaned, is_url, search_target, requester_id, requester_name
+                )
+                if fallback_tracks:
+                    return fallback_tracks
             raise primary_exc
 
         return []
@@ -410,11 +587,15 @@ class YTDLPExtractor:
     @classmethod
     async def resolve_stream(cls, track: Track) -> Track:
         """Fetch a fresh playable audio stream URL right before starting playback."""
+        if track.stream_url and "saavncdn.com" in track.stream_url:
+            return track
         return await asyncio.to_thread(cls._resolve_stream_sync, track)
 
     @classmethod
     def _resolve_stream_sync(cls, track: Track) -> Track:
-        info = cls._extract_with_fallbacks(
+        if track.stream_url and "saavncdn.com" in track.stream_url:
+            return track
+        info = cls._extract_youtube_once(
             track.webpage_url,
             is_playlist=False,
             max_playlist_items=1,
