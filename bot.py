@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import sys
 from typing import Optional
 
+import aiohttp
 from aiohttp import web
 import discord
 from discord.ext import commands
@@ -36,6 +38,7 @@ class MusicBot(commands.Bot):
         self.config = config
         self._profile_synced = False
         self._web_runner: Optional[web.AppRunner] = None
+        self._keep_alive_task: Optional[asyncio.Task] = None
 
     async def _start_health_server(self) -> None:
         """Start a lightweight HTTP health endpoint when hosted on cloud platforms that provide PORT."""
@@ -62,13 +65,37 @@ class MusicBot(commands.Bot):
         self._web_runner = runner
         logger.info("Health server listening on 0.0.0.0:%d", port)
 
+    async def _keep_alive_loop(self) -> None:
+        """Ping Render's public URL every 5 minutes so the free container never spins down mid-song."""
+        external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if not external_url:
+            return
+        ping_url = f"{external_url}/health"
+        logger.info("Self keep-alive enabled: pinging %s every 5 minutes.", ping_url)
+        timeout = aiohttp.ClientTimeout(total=15)
+        while not self.is_closed():
+            await asyncio.sleep(300)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(ping_url) as resp:
+                        logger.info("Self keep-alive ping %s -> %d", ping_url, resp.status)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Self keep-alive ping failed: %s", exc)
+
     async def setup_hook(self) -> None:
         await self._start_health_server()
+        if os.getenv("RENDER_EXTERNAL_URL", "").strip():
+            self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
         await self.add_cog(MusicCog(self, self.config))
         synced = await self.tree.sync()
         logger.info("Synced %d slash command(s).", len(synced))
 
     async def close(self) -> None:
+        if self._keep_alive_task is not None and not self._keep_alive_task.done():
+            self._keep_alive_task.cancel()
+            self._keep_alive_task = None
         if self._web_runner is not None:
             await self._web_runner.cleanup()
             self._web_runner = None
