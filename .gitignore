@@ -1,0 +1,7 @@
+.env
+.avatar_synced.sha256
+cookies.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
