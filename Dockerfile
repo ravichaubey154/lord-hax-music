@@ -21,6 +21,6 @@ RUN pip install --no-cache-dir \
     "Pillow>=10.0.0" \
     "python-dotenv>=1.0.0"
 
-COPY bot.py config.py music.py welcome_bot.py ./
+COPY bot.py config.py music.py welcome_bot.py default_welcome.gif default_goodbye.gif ./
 
 CMD ["python", "-u", "bot.py"]
