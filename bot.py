@@ -54,6 +54,8 @@ class MusicBot(commands.Bot):
         app = web.Application()
 
         async def _health(_request: web.Request) -> web.Response:
+            if os.getenv("WELCOME_BOT_TOKEN", "").strip():
+                return web.Response(text=f"{self.config.bot_name} & Lord Welcome online")
             return web.Response(text=f"{self.config.bot_name} is online")
 
         app.router.add_get("/", _health)
@@ -159,6 +161,49 @@ class MusicBot(commands.Bot):
         await ctx.send("Command chalate waqt kuch error aa gaya. Console logs check karo.")
 
 
+async def _run_bot_supervised(name: str, coro_factory) -> None:
+    """Run a Discord bot task so an error in one bot never crashes the sibling bot."""
+    while True:
+        try:
+            await coro_factory()
+            break
+        except asyncio.CancelledError:
+            break
+        except discord.LoginFailure:
+            logger.error("[%s] Invalid bot token! Not retrying.", name)
+            break
+        except discord.PrivilegedIntentsRequired:
+            logger.error("[%s] Required Privileged Intents are not enabled in Discord Portal!", name)
+            break
+        except Exception as exc:
+            logger.exception("[%s] Unexpected crash (%s); restarting in 10s...", name, exc)
+            await asyncio.sleep(10)
+
+
+async def _run_all(config: BotConfig, welcome_token: str) -> None:
+    from welcome_bot import run_welcome_bot
+
+    welcome_name = os.getenv("WELCOME_BOT_NAME", "Lord Welcome").strip() or "Lord Welcome"
+    welcome_prefix = os.getenv("WELCOME_COMMAND_PREFIX", "!").strip() or "!"
+    tasks = [
+        asyncio.create_task(
+            _run_bot_supervised(config.bot_name, lambda: MusicBot(config).start(config.token))
+        ),
+        asyncio.create_task(
+            _run_bot_supervised(
+                welcome_name,
+                lambda: run_welcome_bot(
+                    token=welcome_token,
+                    bot_name=welcome_name,
+                    command_prefix=welcome_prefix,
+                    embed_color=config.embed_color,
+                ),
+            )
+        ),
+    ]
+    await asyncio.gather(*tasks)
+
+
 def main() -> None:
     config = BotConfig.from_env()
     if not config.token or config.token == "YOUR_BOT_TOKEN_HERE":
@@ -166,6 +211,15 @@ def main() -> None:
             "DISCORD_TOKEN missing hai! `.env` file open karke apna Discord Bot Token paste karo."
         )
         sys.exit(1)
+
+    welcome_token = os.getenv("WELCOME_BOT_TOKEN", "").strip()
+    if welcome_token:
+        logger.info("Starting BOTH %s and Lord Welcome in unified runner...", config.bot_name)
+        try:
+            asyncio.run(_run_all(config, welcome_token))
+        except KeyboardInterrupt:
+            pass
+        return
 
     bot = MusicBot(config)
     try:
