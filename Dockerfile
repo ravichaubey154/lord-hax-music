@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libopus0 \
     nodejs \
+    fonts-dejavu-core \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,8 +18,9 @@ RUN pip install --no-cache-dir \
     "davey>=0.1.6,<0.2" \
     "yt-dlp[default]>=2025.1.0" \
     "pycryptodome>=3.17.0" \
+    "Pillow>=10.0.0" \
     "python-dotenv>=1.0.0"
 
-COPY bot.py config.py music.py ./
+COPY bot.py config.py music.py welcome_bot.py ./
 
 CMD ["python", "-u", "bot.py"]
