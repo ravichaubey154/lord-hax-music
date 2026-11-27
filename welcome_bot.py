@@ -913,6 +913,18 @@ class WelcomeCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="Server Designer (Inferno Gamer + 7 Themes)",
+            value=(
+                "`/restyle [theme] [scope]` — Channels ko emoji + fancy font mein design karo\n"
+                "`/undorestyle` — Purane channel names restore karo\n"
+                "`/addmodule <module> [theme]` — Ready-made gaming category add karo\n"
+                "`/divider [fire|neon|rgb]` — Animated neon divider GIF post karo\n"
+                "`/addemojis` — 6 animated neon gaming emojis upload karo\n"
+                "`/themes` — Saare themes & modules dekho"
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="Text & Extras",
             value=(
                 "`/settitle <text>` | `/setmessage <text>` | `/setcolor <#HEX>`\n"
@@ -942,7 +954,10 @@ class WelcomeBot(commands.Bot):
         self.store = ConfigStore()
 
     async def setup_hook(self) -> None:
+        from design_cog import DesignCog
+
         await self.add_cog(WelcomeCog(self, self.bot_name, "!", self.embed_color, self.store))
+        await self.add_cog(DesignCog(self, self.bot_name))
         synced = await self.tree.sync()
         logger.info("[%s] Synced %d slash command(s).", self.bot_name, len(synced))
 
