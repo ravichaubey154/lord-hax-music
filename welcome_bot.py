@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -20,6 +21,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "welcome_data"
 BACKGROUNDS_DIR = DATA_DIR / "backgrounds"
 SETTINGS_FILE = DATA_DIR / "guilds.json"
+DEFAULT_WELCOME_BANNER = BASE_DIR / "default_welcome.gif"
+DEFAULT_GOODBYE_BANNER = BASE_DIR / "default_goodbye.gif"
 
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -276,7 +279,7 @@ class GuildWelcomeConfig:
     goodbye_title: str = DEFAULT_GOODBYE_TITLE
     goodbye_message: str = DEFAULT_GOODBYE
     color: int = 0x38BDF8
-    goodbye_color: int = 0xF43F5E
+    goodbye_color: int = 0xA855F7
     mode: Literal["card", "banner"] = "card"
     image_filename: Optional[str] = None
     image_url: Optional[str] = None
@@ -481,13 +484,18 @@ class WelcomeCog(commands.Cog):
         self.store.update(gcfg)
         self.bot.loop.create_task(self._backup_to_owner_dm())
 
+    @staticmethod
+    def _norm_channel_name(name: str) -> str:
+        """Normalize stylized Unicode fonts (e.g. '🤝・𝐖𝐞𝐥𝐜𝐨𝐦𝐞' -> 'welcome') for channel matching."""
+        return unicodedata.normalize("NFKD", name).lower()
+
     def _find_welcome_ch(self, guild: discord.Guild, gcfg: GuildWelcomeConfig) -> Optional[discord.TextChannel]:
         if gcfg.welcome_channel_id:
             ch = guild.get_channel(gcfg.welcome_channel_id)
             if isinstance(ch, discord.TextChannel):
                 return ch
         for ch in guild.text_channels:
-            if "welcome" in ch.name.lower():
+            if "welcome" in self._norm_channel_name(ch.name):
                 perms = ch.permissions_for(guild.me)
                 if perms.send_messages and perms.embed_links:
                     return ch
@@ -503,7 +511,8 @@ class WelcomeCog(commands.Cog):
             if isinstance(ch, discord.TextChannel):
                 return ch
         for ch in guild.text_channels:
-            if any(k in ch.name.lower() for k in ("goodbye", "leave", "bye")):
+            cname = self._norm_channel_name(ch.name)
+            if any(k in cname for k in ("goodbye", "good-bye", "leave", "bye", "exit")):
                 perms = ch.permissions_for(guild.me)
                 if perms.send_messages and perms.embed_links:
                     return ch
@@ -576,10 +585,14 @@ class WelcomeCog(commands.Cog):
         bg_bytes, bg_ext = await self._load_bg(guild, gcfg, kind)
         used_anim = gcfg.goodbye_is_animated if is_goodbye else gcfg.is_animated
         fallback_url = gcfg.goodbye_image_url if is_goodbye else gcfg.image_url
-        if is_goodbye and bg_bytes is None and not fallback_url:
-            bg_bytes, bg_ext = await self._load_bg(guild, gcfg, "welcome")
-            used_anim = gcfg.is_animated
-            fallback_url = gcfg.image_url
+
+        # Fall back to the baked-in animated neon gaming banner GIF when no custom override is set
+        if bg_bytes is None and not fallback_url:
+            default_gif = DEFAULT_GOODBYE_BANNER if is_goodbye else DEFAULT_WELCOME_BANNER
+            if default_gif.is_file():
+                bg_bytes = default_gif.read_bytes()
+                bg_ext = "gif"
+                used_anim = True
 
         mention_content = None if is_goodbye else member.mention
         if gcfg.mode == "banner" or (bg_bytes is not None and (used_anim or bg_ext == "gif")):
@@ -866,8 +879,8 @@ class WelcomeCog(commands.Cog):
         embed.add_field(name="Welcome Channel", value=wch.mention if wch else "Not set", inline=True)
         embed.add_field(name="Goodbye/Leave", value=f"ON ({gch.mention})" if gch else ("ON (auto)" if gcfg.goodbye_enabled else "Off"), inline=True)
         embed.add_field(name="Mode", value=f"`{gcfg.mode}`", inline=True)
-        embed.add_field(name="Welcome Image", value="Custom set" if (gcfg.image_filename or gcfg.image_url or gcfg.image_source_message_id) else "Default Neon", inline=True)
-        embed.add_field(name="Goodbye Image", value="Custom set" if (gcfg.goodbye_image_filename or gcfg.goodbye_image_url or gcfg.goodbye_image_source_message_id) else "Same / Default", inline=True)
+        embed.add_field(name="Welcome Image", value="Custom set" if (gcfg.image_filename or gcfg.image_url or gcfg.image_source_message_id) else "Cyber City Storm (#1 GIF)", inline=True)
+        embed.add_field(name="Goodbye Image", value="Custom set" if (gcfg.goodbye_image_filename or gcfg.goodbye_image_url or gcfg.goodbye_image_source_message_id) else "Void Army Portal (#10 GIF)", inline=True)
         embed.add_field(name="Auto-Role", value=role.mention if role else "Off", inline=True)
         if self._icon():
             embed.set_thumbnail(url=self._icon())
